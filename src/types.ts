@@ -68,6 +68,44 @@ export const fail = (error: string): ToolResult => ({ ok: false, error });
 /** Modpack sources supported by the modpack module. */
 export type ModpackSource = 'modrinth' | 'curseforge';
 
+/** Loader ids supported by the loader tools — all are HMCL VersionList ids. */
+export type LoaderId =
+  | 'fabric'
+  | 'forge'
+  | 'neoforge'
+  | 'quilt'
+  | 'optifine'
+  | 'liteloader'
+  | 'legacyfabric'
+  | 'cleanroom';
+
+/** Input of the install_mod tool / agent POST /mods/install. */
+export interface ModInstallRequest {
+  source?: ModpackSource;
+  /** Mod project id (Modrinth slug / CurseForge numeric id) to download first. */
+  id?: string;
+  versionId?: string;
+  /** Local mod file to install instead of downloading. */
+  path?: string;
+  /** Target instance id (a version dir under <workdir>/versions/). Required. */
+  instance: string;
+}
+
+/** Input of the install_loader tool / agent POST /loader/install. */
+export interface LoaderInstallRequest {
+  loader: LoaderId;
+  /** Loader version (selfVersion from list_loader_versions), e.g. "0.16.14". */
+  versionId?: string;
+  /** Alternative selector: the full version id, e.g. "fabric-loader-0.16.14-1.21.4". */
+  fullVersion?: string;
+  /** Minecraft version the loader must target (required when creating a new instance). */
+  gameVersion?: string;
+  /** Install into this existing instance instead of creating a new one. */
+  instance?: string;
+  /** Name of the new instance (defaults to "<mc>-<loader>"). */
+  name?: string;
+}
+
 /** Normalized modpack summary returned by search / get tools. */
 export interface ModpackSummary {
   source: ModpackSource;
@@ -131,6 +169,22 @@ export interface AgentHandle {
   getModpack(source: ModpackSource, id: string): Promise<AgentResult>;
   /** POST /modpack/download — HMCL downloads the pack file (sha1-verified) into <workdir>/mcpacks/. Never throws. */
   downloadModpack(source: ModpackSource, id: string, versionId?: string): Promise<AgentResult>;
+  /** POST /mods/search (HMCL MODS repositories, CurseForge uses HMCL's embedded key). Never throws. */
+  searchMods(source: ModpackSource, query: string, gameVersion?: string, limit?: number): Promise<AgentResult>;
+  /** POST /mods/info. Never throws. */
+  getMod(source: ModpackSource, id: string): Promise<AgentResult>;
+  /** POST /mods/download — HMCL downloads the mod file (sha1-verified) into <workdir>/modfiles/. Never throws. */
+  downloadMod(source: ModpackSource, id: string, versionId?: string): Promise<AgentResult>;
+  /** POST /mods/install — download (or reuse a local path) and place the mod into <instance>/mods/. Never throws. */
+  installMod(req: ModInstallRequest): Promise<AgentResult>;
+  /** POST /mods/list — list the .jar files of <instance>/mods/. Never throws. */
+  listMods(instance: string): Promise<AgentResult>;
+  /** POST /loaders/list — loader versions available for a Minecraft version. Never throws. */
+  listLoaderVersions(loader: LoaderId, gameVersion: string): Promise<AgentResult>;
+  /** POST /loader/install — install a loader into an existing instance or as a new instance. Never throws. */
+  installLoader(req: LoaderInstallRequest): Promise<AgentResult>;
+  /** POST /versions/remote — installable Minecraft versions from the remote list. Never throws. */
+  listRemoteVersions(type?: 'release' | 'snapshot' | 'all'): Promise<AgentResult>;
   /** POST /launch. Throws on transport/agent errors. */
   launch(req: LaunchRequest): Promise<LaunchInfo>;
   /** POST /launch/stop. Never throws for user-level failures. */
@@ -188,6 +242,14 @@ export interface LaunchInfo {
  *  download_modpack             — download the pack file into <workdir>/mcpacks/ (sha1 verified)
  *  install_modpack              — download (if id given) then agent-install the file into an instance
  *  list_modpacks                — scan <workdir>/versions/<id>/modpack.json
+ *  search_mods                  — HMCL MODS repositories search (Modrinth / CurseForge)
+ *  get_mod                      — mod project + version details
+ *  download_mod                 — download a mod file into <workdir>/modfiles/ (sha1 verified)
+ *  install_mod                  — download (or local path) + place the file into <instance>/mods/
+ *  list_mods                    — list the .jar files of <instance>/mods/
+ *  list_loader_versions         — loader versions (fabric/forge/neoforge/quilt/...) for a MC version
+ *  install_loader               — install a loader into an existing instance or as a new instance
+ *  list_remote_versions         — installable Minecraft versions from the remote list
  *  launch_game                  — agent: launch instance (offline account) as child process
  *  stop_game                    — agent: stop the running game process
  */

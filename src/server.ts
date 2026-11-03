@@ -21,6 +21,7 @@ export function getLastToolCount(): number {
 interface ToolModule {
   createHmclTools?: (ctx: Ctx) => ToolDef[];
   createModpackTools?: (ctx: Ctx) => ToolDef[];
+  createModTools?: (ctx: Ctx) => ToolDef[];
 }
 
 /** Load `relative` (a .js specifier), falling back to the .ts source in dev (tsx). */
@@ -51,6 +52,10 @@ async function collectTools(ctx: Ctx): Promise<ToolDef[]> {
   const modpack = await loadToolModule<ToolModule>('./modpack/modpack.js', ctx);
   if (modpack?.createModpackTools) {
     tools.push(...modpack.createModpackTools(ctx));
+  }
+  const mods = await loadToolModule<ToolModule>('./mod/mods.js', ctx);
+  if (mods?.createModTools) {
+    tools.push(...mods.createModTools(ctx));
   }
   return tools;
 }

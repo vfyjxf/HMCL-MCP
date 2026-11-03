@@ -13,14 +13,15 @@ import com.sun.net.httpserver.HttpServer;
 import org.jackhuang.hmcl.addon.RemoteAddon;
 import org.jackhuang.hmcl.addon.RemoteAddonRepository;
 import org.jackhuang.hmcl.addon.repository.CurseForgeRemoteAddonRepository;
-import org.jackhuang.hmcl.addon.repository.ModrinthRemoteAddonRepository;
-import org.jackhuang.hmcl.auth.AuthInfo;
+import org.jackhuang.hmcl.addon.repository.ModrinthRemoteAddonRepository;import org.jackhuang.hmcl.auth.AuthInfo;
 import org.jackhuang.hmcl.auth.AuthenticationException;
 import org.jackhuang.hmcl.auth.offline.OfflineAccount;
 import org.jackhuang.hmcl.auth.offline.OfflineAccountFactory;
 import org.jackhuang.hmcl.download.VersionList;
 import org.jackhuang.hmcl.download.DownloadProvider;
+import org.jackhuang.hmcl.download.RemoteVersion;
 import org.jackhuang.hmcl.download.game.GameRemoteVersion;
+import org.jackhuang.hmcl.game.ReleaseType;
 import org.jackhuang.hmcl.game.GameJavaVersion;
 import org.jackhuang.hmcl.game.HMCLGameRepository;
 import org.jackhuang.hmcl.game.LaunchOptions;
@@ -55,13 +56,21 @@ import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
+import java.util.Locale;
+import java.util.Set;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * Loopback HTTP JSON API (127.0.0.1 only). Every request must carry
@@ -117,6 +126,46 @@ public final class HttpApi {
                 case "/versions/install" -> {
                     if (requirePost(exchange, method, "POST")) {
                         installVersion(state, exchange);
+                    }
+                }
+                case "/versions/remote" -> {
+                    if (requirePost(exchange, method, "POST")) {
+                        listRemoteVersions(state, exchange);
+                    }
+                }
+                case "/mods/search" -> {
+                    if (requirePost(exchange, method, "POST")) {
+                        searchMods(state, exchange);
+                    }
+                }
+                case "/mods/info" -> {
+                    if (requirePost(exchange, method, "POST")) {
+                        modInfo(state, exchange);
+                    }
+                }
+                case "/mods/download" -> {
+                    if (requirePost(exchange, method, "POST")) {
+                        downloadMod(state, exchange);
+                    }
+                }
+                case "/mods/install" -> {
+                    if (requirePost(exchange, method, "POST")) {
+                        installMod(state, exchange);
+                    }
+                }
+                case "/mods/list" -> {
+                    if (requirePost(exchange, method, "POST")) {
+                        listMods(state, exchange);
+                    }
+                }
+                case "/loaders/list" -> {
+                    if (requirePost(exchange, method, "POST")) {
+                        listLoaders(state, exchange);
+                    }
+                }
+                case "/loader/install" -> {
+                    if (requirePost(exchange, method, "POST")) {
+                        installLoader(state, exchange);
                     }
                 }
                 case "/modpack/install" -> {
@@ -234,7 +283,7 @@ public final class HttpApi {
             @SuppressWarnings("unchecked")
             VersionList<GameRemoteVersion> list =
                     (VersionList<GameRemoteVersion>) DownloadProviders.getDownloadProvider().getVersionListById("game");
-            runTask(list.refreshAsync(""), "Refreshing the remote version list");
+            runTask(list.refreshAsync(""), "Refreshing the remote version list", REFRESH_TIMEOUT_MS);
 
             GameRemoteVersion remote = list.getVersions("").stream()
                     .filter(v -> id.equals(v.getFullVersion()))
@@ -250,8 +299,13 @@ public final class HttpApi {
             runTask(state.dependency.gameBuilder()
                     .name(id)
                     .gameVersion(id)
-                    .buildAsync(), "Installing Minecraft " + id);
+                    .buildAsync(), "Installing Minecraft " + id, INSTALL_TIMEOUT_MS);
             state.repository.refreshVersions();
+            if (!state.repository.hasVersion(id)) {
+                respond(exchange, 200, failJson("Minecraft " + id
+                        + " install did not produce a playable instance (HMCL rolled it back after a failure)"));
+                return;
+            }
 
             JsonObject out = new JsonObject();
             out.addProperty("id", id);
@@ -260,6 +314,557 @@ public final class HttpApi {
             log("Version install failed: " + t);
             t.printStackTrace(System.err);
             respond(exchange, 200, failJson("Version install failed: " + message(t)));
+        } finally {
+            state.stateLock.unlock();
+        }
+    }
+
+    /** POST /versions/remote {"type"?: "release"|"snapshot"|"all"} — list installable Minecraft versions. */
+    private static void listRemoteVersions(AgentState state, HttpExchange exchange) throws IOException {
+        JsonObject body = parseBody(exchange);
+        String typeFilter = stringOrNull(body, "type");
+        state.stateLock.lock();
+        try {
+            log("Refreshing remote game version list ...");
+            @SuppressWarnings("unchecked")
+            VersionList<GameRemoteVersion> list =
+                    (VersionList<GameRemoteVersion>) DownloadProviders.getDownloadProvider().getVersionListById("game");
+            runTask(list.refreshAsync(""), "Refreshing the remote version list", REFRESH_TIMEOUT_MS);
+            JsonArray versions = new JsonArray();
+            for (GameRemoteVersion v : list.getVersions("")) {
+                String type = v.getType() == null ? "unknown" : v.getType().name().toLowerCase(Locale.ROOT);
+                if ("release".equals(typeFilter) && !"release".equals(type)) continue;
+                if ("snapshot".equals(typeFilter) && !"snapshot".equals(type)) continue;
+                JsonObject vo = new JsonObject();
+                vo.addProperty("id", v.getFullVersion());
+                vo.addProperty("type", type);
+                if (v.getReleaseDate() != null) {
+                    vo.addProperty("releaseDate", v.getReleaseDate().toString());
+                }
+                versions.add(vo);
+            }
+            JsonObject out = new JsonObject();
+            out.add("versions", versions);
+            respond(exchange, 200, okJson(out));
+        } catch (Throwable t) {
+            log("Remote version list failed: " + t);
+            respond(exchange, 200, failJson("Failed to list remote versions: " + message(t)));
+        } finally {
+            state.stateLock.unlock();
+        }
+    }
+
+    // ------------------------------------------------------------------ mods (single-mod search / download / install)
+
+    /** HMCL's own mod repositories: Modrinth (no key) and CurseForge (HMCL's embedded API key). */
+    private static RemoteAddonRepository modsRepoFor(String source) {
+        return switch (source == null ? "modrinth" : source) {
+            case "curseforge" -> CurseForgeRemoteAddonRepository.MODS;
+            default -> ModrinthRemoteAddonRepository.MODS;
+        };
+    }
+
+    /** Shared JSON mapping of a RemoteAddon.Version. */
+    private static JsonObject addonVersionJson(RemoteAddon.Version v) {
+        JsonObject vo = new JsonObject();
+        vo.addProperty("id", v.name());
+        vo.addProperty("version", v.version());
+        JsonArray gv = new JsonArray();
+        v.gameVersions().forEach(gv::add);
+        vo.add("gameVersions", gv);
+        JsonArray loaders = new JsonArray();
+        v.loaders().forEach(l -> loaders.add(l.toString()));
+        vo.add("loaders", loaders);
+        if (v.file() != null && v.file().filename() != null) {
+            vo.addProperty("filename", v.file().filename());
+        }
+        return vo;
+    }
+
+    /** Pick the version matching versionId (name or version string), or the newest when null. */
+    /**
+     * Resolves an addon id usable with {@code getModById}/{@code getRemoteVersionsById}.
+     * Modrinth accepts slugs; CurseForge's API only accepts the numeric project id, so a
+     * non-numeric id is resolved through a slug-matching search first (one extra request).
+     */
+    private static String resolveAddonId(RemoteAddonRepository repo, DownloadProvider provider,
+                                         String id) throws IOException {
+        if (!(repo instanceof CurseForgeRemoteAddonRepository) || id.matches("\\d+")) {
+            return id;
+        }
+        RemoteAddonRepository.SearchResult result = repo.search(provider, "", null, 0, 50, id,
+                RemoteAddonRepository.SortType.POPULARITY, RemoteAddonRepository.SortOrder.DESC);
+        for (RemoteAddon addon : result.getResults().toList()) {
+            if (id.equalsIgnoreCase(addon.slug()) || id.equalsIgnoreCase(addon.title())) {
+                String numeric = numericIdOf(addon);
+                if (numeric != null) {
+                    return numeric;
+                }
+            }
+        }
+        throw new IOException("Mod '" + id + "' not found on CurseForge — CurseForge needs the numeric"
+                + " project id; take 'numericId' from the search_mods results");
+    }
+
+    /** Numeric CurseForge project id carried in {@code addon.data()}, or null for other sources. */
+    private static String numericIdOf(RemoteAddon addon) {
+        if (addon.data() instanceof CurseForgeRemoteAddonRepository.CurseAddon curse) {
+            return Integer.toString(curse.id());
+        }
+        return null;
+    }
+
+    private static RemoteAddon.Version findAddonVersion(RemoteAddonRepository repo, DownloadProvider provider,
+                                                        String id, String wantedVersion) throws IOException {
+        id = resolveAddonId(repo, provider, id);
+        for (RemoteAddon.Version v : repo.getRemoteVersionsById(provider, id).limit(200).toList()) {
+            if (wantedVersion == null || wantedVersion.isBlank()
+                    || wantedVersion.equals(v.name()) || wantedVersion.equals(v.version())) {
+                return v;
+            }
+        }
+        return null;
+    }
+
+    /** Download a mod file (sha1-verified) into <workdir>/modfiles/ and return the target path. */
+    private static Path downloadAddonFile(AgentState state, String id, RemoteAddon.Version version)
+            throws IOException {
+        RemoteAddon.File file = version.file();
+        if (file == null || file.url() == null || file.url().isBlank()) {
+            throw new IOException("Version '" + version.name() + "' has no downloadable file");
+        }
+        Path dir = state.gameDir.resolve("modfiles");
+        Files.createDirectories(dir);
+        String filename = (file.filename() != null && !file.filename().isBlank())
+                ? file.filename().replaceAll("[\\\\/:*?\"<>|]", "_")
+                : version.name() + ".jar";
+        Path target = dir.resolve(filename);
+        if (!Files.exists(target)) {
+            log("Downloading mod '" + id + "' version '" + version.name() + "' -> " + target);
+            state.stateLock.lock();
+            try {
+                runTask(new FileDownloadTask(file.url(), target, file.getIntegrityCheck()),
+                        "Downloading mod " + id, DOWNLOAD_TIMEOUT_MS);
+            } finally {
+                state.stateLock.unlock();
+            }
+        }
+        return target;
+    }
+
+    /** POST /mods/search {"source"?,"query","gameVersion"?,"limit"?} */
+    private static void searchMods(AgentState state, HttpExchange exchange) throws IOException {
+        JsonObject body = parseBody(exchange);
+        String query = stringOrNull(body, "query");
+        if (query == null || query.isBlank()) {
+            respond(exchange, 200, failJson("Missing required field 'query'"));
+            return;
+        }
+        int limit = 20;
+        if (body.has("limit")) {
+            limit = Math.max(1, Math.min(50, body.get("limit").getAsInt()));
+        }
+        try {
+            RemoteAddonRepository repo = modsRepoFor(stringOrNull(body, "source"));
+            DownloadProvider provider = DownloadProviders.getDownloadProvider();
+            String gameVersion = stringOrNull(body, "gameVersion");
+            RemoteAddonRepository.SearchResult result = repo.search(provider,
+                    gameVersion == null ? "" : gameVersion, null, 0, limit, query,
+                    RemoteAddonRepository.SortType.POPULARITY, RemoteAddonRepository.SortOrder.DESC);
+            JsonObject out = new JsonObject();
+            JsonArray hits = new JsonArray();
+            result.getResults().forEach(addon -> hits.add(addonJson(addon)));
+            out.add("hits", hits);
+            out.addProperty("totalPages", result.getTotalPages());
+            respond(exchange, 200, okJson(out));
+        } catch (Exception e) {
+            respond(exchange, 200, failJson("Mod search failed: " + message(e)));
+        }
+    }
+
+    /** POST /mods/info {"source"?,"id"} — mod project summary + version list. */
+    private static void modInfo(AgentState state, HttpExchange exchange) throws IOException {
+        JsonObject body = parseBody(exchange);
+        String id = stringOrNull(body, "id");
+        if (id == null || id.isBlank()) {
+            respond(exchange, 200, failJson("Missing required field 'id'"));
+            return;
+        }
+        try {
+            RemoteAddonRepository repo = modsRepoFor(stringOrNull(body, "source"));
+            DownloadProvider provider = DownloadProviders.getDownloadProvider();
+            id = resolveAddonId(repo, provider, id);
+            RemoteAddon addon = repo.getModById(provider, id);
+            JsonObject out = new JsonObject();
+            out.add("summary", addonJson(addon));
+            JsonArray versions = new JsonArray();
+            repo.getRemoteVersionsById(provider, id).limit(50).forEach(v -> versions.add(addonVersionJson(v)));
+            out.add("versions", versions);
+            respond(exchange, 200, okJson(out));
+        } catch (Exception e) {
+            respond(exchange, 200, failJson("Mod info failed: " + message(e)));
+        }
+    }
+
+    /** POST /mods/download {"source"?,"id","versionId"?} — download a mod file into <workdir>/modfiles/. */
+    private static void downloadMod(AgentState state, HttpExchange exchange) throws IOException {
+        JsonObject body = parseBody(exchange);
+        String id = stringOrNull(body, "id");
+        if (id == null || id.isBlank()) {
+            respond(exchange, 200, failJson("Missing required field 'id'"));
+            return;
+        }
+        String wantedVersion = stringOrNull(body, "versionId");
+        try {
+            RemoteAddonRepository repo = modsRepoFor(stringOrNull(body, "source"));
+            DownloadProvider provider = DownloadProviders.getDownloadProvider();
+            RemoteAddon.Version version = findAddonVersion(repo, provider, id, wantedVersion);
+            if (version == null) {
+                respond(exchange, 200, failJson("No downloadable version found for mod '" + id + "'"
+                        + (wantedVersion != null ? " (version '" + wantedVersion + "')" : "")));
+                return;
+            }
+            Path target = downloadAddonFile(state, id, version);
+            JsonObject out = new JsonObject();
+            out.addProperty("id", version.name());
+            out.addProperty("version", version.version());
+            JsonArray gv = new JsonArray();
+            version.gameVersions().forEach(gv::add);
+            out.add("gameVersions", gv);
+            out.addProperty("filename", target.getFileName().toString());
+            out.addProperty("path", target.toString());
+            out.addProperty("size", Files.size(target));
+            respond(exchange, 200, okJson(out));
+        } catch (Exception e) {
+            respond(exchange, 200, failJson("Mod download failed: " + message(e)));
+        }
+    }
+
+    /** POST /mods/install {"source"?,"id"?,"versionId"?,"path"?,"instance"} — put a mod jar into <instance>/mods/. */
+    private static void installMod(AgentState state, HttpExchange exchange) throws IOException {
+        JsonObject body = parseBody(exchange);
+        String instance = stringOrNull(body, "instance");
+        if (instance == null || instance.isBlank()) {
+            respond(exchange, 200, failJson("Missing required field 'instance'"));
+            return;
+        }
+        String id = stringOrNull(body, "id");
+        String localPath = stringOrNull(body, "path");
+        try {
+            Path file;
+            if (localPath != null && !localPath.isBlank()) {
+                file = Path.of(localPath).toAbsolutePath().normalize();
+                if (!Files.isRegularFile(file)) {
+                    respond(exchange, 200, failJson("Mod file not found: " + file));
+                    return;
+                }
+            } else if (id != null && !id.isBlank()) {
+                RemoteAddonRepository repo = modsRepoFor(stringOrNull(body, "source"));
+                DownloadProvider provider = DownloadProviders.getDownloadProvider();
+                RemoteAddon.Version version = findAddonVersion(repo, provider, id, stringOrNull(body, "versionId"));
+                if (version == null) {
+                    respond(exchange, 200, failJson("No downloadable version found for mod '" + id + "'"));
+                    return;
+                }
+                file = downloadAddonFile(state, id, version);
+            } else {
+                respond(exchange, 200, failJson("install_mod requires either 'id' (to download) or 'path' (a local mod file)"));
+                return;
+            }
+
+            state.stateLock.lock();
+            try {
+                state.repository.refreshVersions();
+                if (!state.repository.hasVersion(instance)) {
+                    respond(exchange, 200, failJson("Instance '" + instance + "' is not installed — "
+                            + "install it first (install_version / install_loader / install_modpack)"));
+                    return;
+                }
+            } finally {
+                state.stateLock.unlock();
+            }
+
+            Path modsDir = state.gameDir.resolve("versions").resolve(instance).resolve("mods");
+            Files.createDirectories(modsDir);
+            String filename = file.getFileName().toString().replaceAll("[\\\\/:*?\"<>|]", "_");
+            Path target = modsDir.resolve(filename);
+            if (!file.equals(target)) {
+                Files.copy(file, target, StandardCopyOption.REPLACE_EXISTING);
+            }
+            log("Mod installed into instance '" + instance + "': " + target);
+            JsonObject out = new JsonObject();
+            out.addProperty("instance", instance);
+            out.addProperty("modsDir", modsDir.toString());
+            out.addProperty("filename", filename);
+            out.addProperty("path", target.toString());
+            respond(exchange, 200, okJson(out));
+        } catch (Throwable t) {
+            log("Mod install failed: " + t);
+            respond(exchange, 200, failJson("Mod install failed: " + message(t)));
+        }
+    }
+
+    /** POST /mods/list {"instance"} — list the .jar files in <instance>/mods/. */
+    private static void listMods(AgentState state, HttpExchange exchange) throws IOException {
+        JsonObject body = parseBody(exchange);
+        String instance = stringOrNull(body, "instance");
+        if (instance == null || instance.isBlank()) {
+            respond(exchange, 200, failJson("Missing required field 'instance'"));
+            return;
+        }
+        try {
+            Path modsDir = state.gameDir.resolve("versions").resolve(instance).resolve("mods");
+            JsonArray mods = new JsonArray();
+            if (Files.isDirectory(modsDir)) {
+                try (var files = Files.list(modsDir)) {
+                    files.filter(p -> p.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".jar"))
+                            .sorted()
+                            .forEach(p -> {
+                                JsonObject mo = new JsonObject();
+                                mo.addProperty("filename", p.getFileName().toString());
+                                try {
+                                    mo.addProperty("size", Files.size(p));
+                                } catch (IOException ignored) {
+                                    // size is best-effort
+                                }
+                                mods.add(mo);
+                            });
+                }
+            }
+            JsonObject out = new JsonObject();
+            out.addProperty("instance", instance);
+            out.addProperty("modsDir", modsDir.toString());
+            out.add("mods", mods);
+            respond(exchange, 200, okJson(out));
+        } catch (Exception e) {
+            respond(exchange, 200, failJson("Mod list failed: " + message(e)));
+        }
+    }
+
+    // ------------------------------------------------------------------ mod loaders (fabric / forge / neoforge / quilt / ...)
+
+    /** Loader ids accepted by /loaders/list and /loader/install — all are HMCL VersionList ids. */
+    private static final Set<String> LOADER_IDS = Set.of(
+            "fabric", "forge", "neoforge", "quilt", "optifine", "liteloader", "legacyfabric", "cleanroom");
+
+    /** POST /loaders/list {"loader","gameVersion"} — loader versions available for a Minecraft version. */
+    private static void listLoaders(AgentState state, HttpExchange exchange) throws IOException {
+        JsonObject body = parseBody(exchange);
+        String loader = stringOrNull(body, "loader");
+        String gameVersion = stringOrNull(body, "gameVersion");
+        if (loader == null || !LOADER_IDS.contains(loader)) {
+            respond(exchange, 200, failJson("Invalid loader '" + loader + "' — expected one of " + LOADER_IDS));
+            return;
+        }
+        if (gameVersion == null || gameVersion.isBlank()) {
+            respond(exchange, 200, failJson("Missing required field 'gameVersion'"));
+            return;
+        }
+        try {
+            VersionList<?> list = DownloadProviders.getDownloadProvider().getVersionListById(loader);
+            runTask(list.refreshAsync(gameVersion), "Refreshing " + loader + " version list", REFRESH_TIMEOUT_MS);
+            JsonArray arr = new JsonArray();
+            for (Object o : list.getVersions(gameVersion)) {
+                if (o instanceof RemoteVersion rv) {
+                    JsonObject vo = new JsonObject();
+                    vo.addProperty("id", rv.getSelfVersion());
+                    vo.addProperty("fullVersion", rv.getFullVersion());
+                    vo.addProperty("gameVersion", rv.getGameVersion());
+                    arr.add(vo);
+                }
+            }
+            JsonObject out = new JsonObject();
+            out.addProperty("loader", loader);
+            out.addProperty("gameVersion", gameVersion);
+            out.add("versions", arr);
+            respond(exchange, 200, okJson(out));
+        } catch (Throwable t) {
+            log("Loader list failed: " + t);
+            respond(exchange, 200, failJson("Failed to list " + loader + " versions: " + message(t)));
+        }
+    }
+
+    /**
+     * POST /loader/install {"loader","versionId"?,"fullVersion"?,"gameVersion"?,"name"?,"instance"?}
+     * Two modes: with "instance", installs the loader into an existing instance
+     * (dependency.installLibraryAsync); otherwise creates a NEW instance named
+     * "name" (default "<mc>-<loader>") with the vanilla game + loader in one
+     * build (gameBuilder).
+     */
+    private static void installLoader(AgentState state, HttpExchange exchange) throws IOException {
+        JsonObject body = parseBody(exchange);
+        String loader = stringOrNull(body, "loader");
+        if (loader == null || !LOADER_IDS.contains(loader)) {
+            respond(exchange, 200, failJson("Invalid loader '" + loader + "' — expected one of " + LOADER_IDS));
+            return;
+        }
+        String versionId = stringOrNull(body, "versionId");
+        String fullVersion = stringOrNull(body, "fullVersion");
+        String gameVersion = stringOrNull(body, "gameVersion");
+        String instance = stringOrNull(body, "instance");
+        String name = stringOrNull(body, "name");
+
+        state.stateLock.lock();
+        try {
+            VersionList<?> list = DownloadProviders.getDownloadProvider().getVersionListById(loader);
+            String gvForList = gameVersion != null && !gameVersion.isBlank() ? gameVersion : "";
+            if (gvForList.isEmpty() && instance != null && !instance.isBlank()) {
+                // Derive the game version from the existing instance.
+                state.repository.refreshVersions();
+                try {
+                    gvForList = state.repository.getGameVersion(instance).orElse(instance);
+                } catch (VersionNotFoundException e) {
+                    respond(exchange, 200, failJson("Instance '" + instance + "' is not installed"));
+                    return;
+                }
+            }
+            if (gvForList.isEmpty()) {
+                respond(exchange, 200, failJson(
+                        "Missing 'gameVersion' (or 'instance') to resolve the " + loader + " version list"));
+                return;
+            }
+            log("Refreshing " + loader + " version list for Minecraft " + gvForList + " ...");
+            runTask(list.refreshAsync(gvForList), "Refreshing " + loader + " version list", REFRESH_TIMEOUT_MS);
+
+            RemoteVersion remote = null;
+            for (Object o : list.getVersions(gvForList)) {
+                if (o instanceof RemoteVersion rv) {
+                    if ((versionId != null && versionId.equals(rv.getSelfVersion()))
+                            || (fullVersion != null && fullVersion.equals(rv.getFullVersion()))) {
+                        remote = rv;
+                        break;
+                    }
+                }
+            }
+            if (remote == null) {
+                respond(exchange, 200, failJson("No " + loader + " version matched"
+                        + (versionId != null ? " versionId '" + versionId + "'" : "")
+                        + (fullVersion != null ? " fullVersion '" + fullVersion + "'" : "")
+                        + " for Minecraft " + gvForList + " — call list_loader_versions first"));
+                return;
+            }
+
+            if (instance != null && !instance.isBlank()) {
+                // Existing instance: install the loader as a version patch.
+                // installLibraryAsync requires the RAW version (isResolved() == false).
+                Version base;
+                try {
+                    base = state.repository.getVersion(instance);
+                } catch (VersionNotFoundException e) {
+                    respond(exchange, 200, failJson("Instance '" + instance + "' is not installed"));
+                    return;
+                }
+                String instanceGameVersion = state.repository.getGameVersion(base).orElse(instance);
+                if (!instanceGameVersion.equals(remote.getGameVersion())) {
+                    respond(exchange, 200, failJson("Instance '" + instance + "' runs Minecraft "
+                            + instanceGameVersion + " but the selected " + loader
+                            + " version targets " + remote.getGameVersion()));
+                    return;
+                }
+                log("Installing " + loader + " " + remote.getSelfVersion()
+                        + " into existing instance '" + instance + "' ...");
+                // installLibraryAsync requires the RAW version (isResolved() == false) and
+                // only RETURNS the patched version — persistence is the caller's job.
+                Version patched = runTaskResult(
+                        state.dependency.installLibraryAsync(base, remote),
+                        "Installing " + loader + " " + remote.getSelfVersion(), INSTALL_TIMEOUT_MS);
+                if (patched != null) {
+                    // The patch result carries the loader profile's id (e.g.
+                    // "fabric-loader-0.16.14-1.21.4"); restore the user-facing instance id.
+                    runTask(state.repository.saveAsync(patched.setId(instance)),
+                            "Saving patched instance '" + instance + "'", REFRESH_TIMEOUT_MS);
+                }
+                state.repository.refreshVersions();
+                JsonObject out = new JsonObject();
+                out.addProperty("instance", instance);
+                out.addProperty("loader", loader);
+                out.addProperty("loaderVersion", remote.getSelfVersion());
+                out.addProperty("fullVersion", remote.getFullVersion());
+                respond(exchange, 200, okJson(out));
+            } else {
+                // New instance, built in TWO phases: the vanilla game first, then the
+                // loader patch on top. If phase 2 fails (flaky mirror, dead CDN) the
+                // playable vanilla instance still survives — a single all-in-one
+                // gameBuilder build rolls the WHOLE version back on any failure
+                // (DefaultGameBuilder removes the version from disk when it errors).
+                if (gameVersion == null || gameVersion.isBlank()) {
+                    respond(exchange, 200, failJson("Missing required field 'gameVersion' when creating a new instance"));
+                    return;
+                }
+                String instanceName = (name == null || name.isBlank()) ? gameVersion + "-" + loader : name;
+                if (!HMCLGameRepository.isValidVersionId(instanceName)) {
+                    respond(exchange, 200, failJson("Invalid instance name: '" + instanceName + "'"));
+                    return;
+                }
+                state.repository.refreshVersions();
+                boolean vanillaReady = state.repository.hasVersion(instanceName);
+                if (!vanillaReady) {
+                    if (state.repository.versionIdConflicts(instanceName)) {
+                        respond(exchange, 200, failJson("An instance named '" + instanceName
+                                + "' already exists (remove it first or use 'instance' to patch it)"));
+                        return;
+                    }
+                    // Minimal vanilla instance: version JSON + client jar + libraries only.
+                    // Deliberately NOT GameBuilder: it also fetches/validates the whole assets
+                    // tree (600+ MB, thousands of files), which on a flaky network makes
+                    // rebuilds slow or stuck; the pre-launch completion check
+                    // (/launch -> checkGameCompletionAsync) fetches missing assets anyway.
+                    log("Resolving remote Minecraft " + gameVersion + " ...");
+                    @SuppressWarnings("unchecked")
+                    VersionList<GameRemoteVersion> gameList =
+                            (VersionList<GameRemoteVersion>) DownloadProviders.getDownloadProvider()
+                                    .getVersionListById("game");
+                    runTask(gameList.refreshAsync(""), "Refreshing the remote version list",
+                            REFRESH_TIMEOUT_MS);
+                    GameRemoteVersion gameRemote = gameList.getVersions("").stream()
+                            .filter(v -> gameVersion.equals(v.getFullVersion()))
+                            .findFirst()
+                            .orElse(null);
+                    if (gameRemote == null) {
+                        respond(exchange, 200, failJson("Minecraft version '" + gameVersion
+                                + "' not found in the remote version list"));
+                        return;
+                    }
+                    log("Installing Minecraft " + gameVersion + " as new instance '" + instanceName + "' ...");
+                    runTask(state.dependency.installLibraryAsync(new Version(instanceName), gameRemote),
+                            "Installing Minecraft " + gameVersion, INSTALL_TIMEOUT_MS);
+                    state.repository.refreshVersions();
+                    if (!state.repository.hasVersion(instanceName)) {
+                        respond(exchange, 200, failJson("Minecraft " + gameVersion
+                                + " install did not produce a playable instance (HMCL rolled it back after a failure)"));
+                        return;
+                    }
+                }
+                log("Installing " + loader + " " + remote.getSelfVersion()
+                        + " into instance '" + instanceName + "' ...");
+                // installLibraryAsync requires the RAW version (isResolved() == false);
+                // it resolves inheritance itself via resolvePreservingPatches.
+                Version patched = runTaskResult(
+                        state.dependency.installLibraryAsync(state.repository.getVersion(instanceName), remote),
+                        "Installing " + loader + " " + remote.getSelfVersion(), INSTALL_TIMEOUT_MS);
+                if (patched != null) {
+                    // Persist the loader patch (installLibraryAsync only returns it) and
+                    // restore the user-facing instance id (the patch result carries the
+                    // loader profile's id like "fabric-loader-0.20.1-1.20.4").
+                    runTask(state.repository.saveAsync(patched.setId(instanceName)),
+                            "Saving patched instance '" + instanceName + "'", REFRESH_TIMEOUT_MS);
+                }
+                state.repository.refreshVersions();
+                JsonObject out = new JsonObject();
+                out.addProperty("instance", instanceName);
+                out.addProperty("gameVersion", gameVersion);
+                out.addProperty("loader", loader);
+                out.addProperty("loaderVersion", remote.getSelfVersion());
+                out.addProperty("fullVersion", remote.getFullVersion());
+                if (vanillaReady) {
+                    out.addProperty("reused", true);
+                }
+                respond(exchange, 200, okJson(out));
+            }
+        } catch (Throwable t) {
+            log("Loader install failed: " + t);
+            t.printStackTrace(System.err);
+            respond(exchange, 200, failJson("Loader install failed: " + message(t)));
         } finally {
             state.stateLock.unlock();
         }
@@ -308,7 +913,7 @@ public final class HttpApi {
 
             log("Installing modpack '" + instanceName + "' from " + zip + " ...");
             runTask(ModpackHelper.getInstallTask(state.repository, zip, instanceName, modpack, ""),
-                    "Installing modpack " + instanceName);
+                    "Installing modpack " + instanceName, INSTALL_TIMEOUT_MS);
             state.repository.refreshVersions();
             log("Modpack installed: " + instanceName);
 
@@ -350,6 +955,13 @@ public final class HttpApi {
     private static JsonObject addonJson(RemoteAddon addon) {
         JsonObject out = new JsonObject();
         out.addProperty("id", addon.slug());
+        String numericId = numericIdOf(addon);
+        if (numericId != null) {
+            out.addProperty("numericId", numericId);
+        }
+        if (addon.data() instanceof CurseForgeRemoteAddonRepository.CurseAddon curse) {
+            out.addProperty("downloads", curse.downloadCount());
+        }
         out.addProperty("title", addon.title());
         out.addProperty("description", addon.description());
         JsonArray authors = new JsonArray();
@@ -468,7 +1080,7 @@ public final class HttpApi {
             state.stateLock.lock();
             try {
                 runTask(new FileDownloadTask(file.url(), target, file.getIntegrityCheck()),
-                        "Downloading modpack " + id);
+                        "Downloading modpack " + id, DOWNLOAD_TIMEOUT_MS);
             } finally {
                 state.stateLock.unlock();
             }
@@ -546,7 +1158,8 @@ public final class HttpApi {
 
             // Same pre-launch check the HMCL UI runs: downloads missing libraries/assets.
             log("Checking game completion (libraries/assets) ...");
-            runTask(state.dependency.checkGameCompletionAsync(version, false), "Game completion check");
+            runTask(state.dependency.checkGameCompletionAsync(version, false),
+                    "Game completion check", LAUNCH_CHECK_TIMEOUT_MS);
 
             OfflineAccount account = Accounts.FACTORY_OFFLINE.create(
                     username, OfflineAccountFactory.getUUIDFromUserName(username));
@@ -631,7 +1244,25 @@ public final class HttpApi {
     // ------------------------------------------------------------------ helpers
 
     /**
-     * Runs an HMCL task to completion on the caller's thread and throws when it fails.
+     * Runs the blocking wait for an HMCL task graph off the HTTP thread so a stuck
+     * download cannot wedge the endpoint: the wait is bounded by a timeout and the
+     * caller gets an error while the task (if unresponsive to interrupts) keeps
+     * running in the background.
+     */
+    private static final ExecutorService TASK_WAITER = Executors.newCachedThreadPool(runnable -> {
+        Thread thread = new Thread(runnable, "hmcl-agent-task");
+        thread.setDaemon(true);
+        return thread;
+    });
+
+    /** Timeouts per operation class (a dead CDN must fail the request, not hang it). */
+    private static final long REFRESH_TIMEOUT_MS = 180_000;
+    private static final long DOWNLOAD_TIMEOUT_MS = 480_000;
+    private static final long INSTALL_TIMEOUT_MS = 1_200_000;
+    private static final long LAUNCH_CHECK_TIMEOUT_MS = 900_000;
+
+    /**
+     * Runs an HMCL task to completion (default 20-minute install timeout) and throws when it fails.
      *
      * <p>Deliberately NOT {@code Task.run()}: HMCL's task graph (e.g.
      * {@code MultipleSourceVersionList}, {@code whenComplete} actions) relies on
@@ -641,11 +1272,51 @@ public final class HttpApi {
      * failures surface via the root task's {@code getException()}.
      */
     private static void runTask(Task<?> task, String what) throws IOException {
-        boolean success = task.executor().test();
-        if (!success) {
-            Exception failure = task.getException();
-            throw new IOException(what + " failed"
-                    + (failure != null ? ": " + message(failure) : ""));
+        runTaskResult(task, what, INSTALL_TIMEOUT_MS);
+    }
+
+    /** Same as {@link #runTask(Task, String)} with an explicit timeout. */
+    private static void runTask(Task<?> task, String what, long timeoutMs) throws IOException {
+        runTaskResult(task, what, timeoutMs);
+    }
+
+    /**
+     * Runs an HMCL task to completion and returns its result value
+     * ({@code null} for {@code Task<Void>}).
+     *
+     * <p>Deliberately NOT {@code Task.run()}: HMCL's task graph (e.g.
+     * {@code MultipleSourceVersionList}, {@code whenComplete} actions) relies on
+     * {@code isDependentsSucceeded()}/{@code getException()}, which only the
+     * {@code AsyncTaskExecutor} machinery maintains — {@code run()} never sets them.
+     * {@code executor().test()} starts the graph on the shared pool and blocks until done;
+     * failures surface via the root task's {@code getException()}.
+     *
+     * <p>Note: {@code installLibraryAsync} only RETURNS the patched {@link Version}
+     * (downloads happen inside the task, persistence does not) — callers that patch
+     * an existing version must persist the returned value via
+     * {@code repository.saveAsync(...)} themselves.
+     */
+    private static <T> T runTaskResult(Task<T> task, String what, long timeoutMs) throws IOException {
+        Future<T> future = TASK_WAITER.submit(() -> {
+            if (!task.executor().test()) {
+                Exception failure = task.getException();
+                throw new IOException(what + " failed"
+                        + (failure != null ? ": " + message(failure) : ""));
+            }
+            return task.getResult();
+        });
+        try {
+            return future.get(timeoutMs, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            future.cancel(true);
+            throw new IOException(what + " timed out after " + (timeoutMs / 1000)
+                    + "s (the download source is likely unreachable; the task may keep retrying in the background)");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException(what + " was interrupted");
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            throw new IOException(what + " failed: " + message(cause));
         }
     }
 

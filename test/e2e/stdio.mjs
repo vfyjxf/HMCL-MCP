@@ -12,7 +12,7 @@
  *   HMCL_MCP_AGENT_PORT=28521, HMCL_MCP_AGENT_TOKEN=test-token
  *
  * Steps (each asserts, soft failures keep the run going, summary at the end):
- *   1. initialize handshake + tools/list (expect all 13 tools)
+ *   1. initialize handshake + tools/list (expect all 21 tools)
  *   2. check_environment (java, hasHmclJar/hasAgentJar, agentRunning=false)
  *   3. start_hmcl (agent up; hmclVersion 3.16.3)
  *   4. install_version 1.20.4 + list_versions
@@ -51,8 +51,10 @@ const MC_VERSION = '1.20.4';
 const AGENT_BASE = `http://127.0.0.1:${AGENT_PORT}`;
 const EXPECTED_TOOLS = [
   'check_environment', 'install_hmcl', 'start_hmcl', 'stop_hmcl',
-  'list_versions', 'install_version',
+  'list_versions', 'install_version', 'list_remote_versions',
+  'list_loader_versions', 'install_loader',
   'search_modpacks', 'get_modpack', 'download_modpack', 'install_modpack', 'list_modpacks',
+  'search_mods', 'get_mod', 'download_mod', 'install_mod', 'list_mods',
   'launch_game', 'stop_game',
 ];
 

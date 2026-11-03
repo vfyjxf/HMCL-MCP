@@ -19,7 +19,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 
-import type { AgentStatus, Ctx, InstalledModpack, LaunchRequest, ToolDef } from '../types.js';
+import type { AgentStatus, Ctx, InstalledModpack, LaunchRequest, LoaderId, ToolDef } from '../types.js';
 import { fail, ok } from '../types.js';
 import { ensureAgent } from '../hmcl-client.js';
 
@@ -274,6 +274,24 @@ function findJavac(ctx: Ctx): string | null {
   return 'javac not found on PATH — the agent jar is compiled by agent/build.mjs, which needs a JDK. Install JDK 17+ (21 recommended) and make sure both java and javac are available.';
 }
 
+/** Loader ids accepted by the loader tools (must match the agent's LOADER_IDS). */
+const LOADER_IDS = [
+  'fabric',
+  'forge',
+  'neoforge',
+  'quilt',
+  'optifine',
+  'liteloader',
+  'legacyfabric',
+  'cleanroom',
+] as const;
+
+const LOADER_SCHEMA = z.enum(LOADER_IDS);
+
+function isLoaderId(value: unknown): value is LoaderId {
+  return typeof value === 'string' && (LOADER_IDS as readonly string[]).includes(value);
+}
+
 /* ------------------------------------------------------------------ *
  *  Tools
  * ------------------------------------------------------------------ */
@@ -493,6 +511,110 @@ export function createHmclTools(ctx: Ctx): ToolDef[] {
           return ok(result.data ?? { id: version.trim() });
         } catch (err) {
           return fail(`install_version failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      },
+    },
+    {
+      name: 'list_remote_versions',
+      description:
+        'List Minecraft versions available for install_version from the remote version list ' +
+        '(BMCLAPI/Mojang mirrors). type filters: "release" (default: all), "snapshot", or "all". ' +
+        'Returns [{id, type, releaseDate?}] sorted newest-first.',
+      inputSchema: {
+        type: z.enum(['release', 'snapshot', 'all']).optional(),
+      },
+      handler: async (input) => {
+        const type =
+          input.type === 'release' || input.type === 'snapshot' || input.type === 'all'
+            ? input.type
+            : undefined;
+        try {
+          const handle = await ensureAgent(ctx);
+          const result = await handle.listRemoteVersions(type);
+          if (!result.ok) return fail(result.error);
+          return ok(result.data ?? { versions: [] });
+        } catch (err) {
+          return fail(`list_remote_versions failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      },
+    },
+    {
+      name: 'list_loader_versions',
+      description:
+        'List mod-loader versions available for a Minecraft version: fabric, forge, neoforge, quilt, ' +
+        'optifine, liteloader, legacyfabric or cleanroom. Returns [{id (loader version), fullVersion ' +
+        '(instance id used internally), gameVersion}] — pass `id` to install_loader.',
+      inputSchema: {
+        loader: LOADER_SCHEMA,
+        gameVersion: z.string().describe('Minecraft version, e.g. "1.21.4"'),
+      },
+      handler: async (input) => {
+        if (!isLoaderId(input.loader)) {
+          return fail(`list_loader_versions requires a "loader" in ${LOADER_IDS.join(', ')}`);
+        }
+        const gameVersion = typeof input.gameVersion === 'string' ? input.gameVersion.trim() : '';
+        if (!gameVersion) return fail('list_loader_versions requires a "gameVersion", e.g. "1.21.4"');
+        try {
+          const handle = await ensureAgent(ctx);
+          const result = await handle.listLoaderVersions(input.loader, gameVersion);
+          if (!result.ok) return fail(result.error);
+          return ok(result.data ?? { loader: input.loader, gameVersion, versions: [] });
+        } catch (err) {
+          return fail(`list_loader_versions failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      },
+    },
+    {
+      name: 'install_loader',
+      description:
+        'Install a mod loader (fabric/forge/neoforge/quilt/optifine/liteloader/legacyfabric/cleanroom). ' +
+        'Two modes: pass instance to install the loader into an EXISTING instance, or gameVersion ' +
+        '(+ optional name) to create a NEW instance with the vanilla game and the loader in one build. ' +
+        'versionId is a loader version from list_loader_versions (e.g. "0.16.14"); fullVersion ' +
+        '(e.g. "fabric-loader-0.16.14-1.21.4") also works. Downloads loader libraries through HMCL.',
+      inputSchema: {
+        loader: LOADER_SCHEMA,
+        versionId: z.string().optional(),
+        fullVersion: z.string().optional(),
+        gameVersion: z.string().optional(),
+        instance: z.string().optional(),
+        name: z.string().optional(),
+      },
+      handler: async (input) => {
+        if (!isLoaderId(input.loader)) {
+          return fail(`install_loader requires a "loader" in ${LOADER_IDS.join(', ')}`);
+        }
+        const versionId =
+          typeof input.versionId === 'string' && input.versionId ? input.versionId : undefined;
+        const fullVersion =
+          typeof input.fullVersion === 'string' && input.fullVersion ? input.fullVersion : undefined;
+        const gameVersion =
+          typeof input.gameVersion === 'string' && input.gameVersion ? input.gameVersion : undefined;
+        const instance =
+          typeof input.instance === 'string' && input.instance ? input.instance : undefined;
+        const name = typeof input.name === 'string' && input.name.trim() ? input.name.trim() : undefined;
+        if (!versionId && !fullVersion) {
+          return fail('install_loader requires versionId or fullVersion (see list_loader_versions)');
+        }
+        if (!instance && !gameVersion) {
+          return fail(
+            'install_loader requires "instance" (existing instance to patch) or "gameVersion" (new instance)',
+          );
+        }
+        try {
+          const handle = await ensureAgent(ctx);
+          const result = await handle.installLoader({
+            loader: input.loader,
+            versionId,
+            fullVersion,
+            gameVersion,
+            instance,
+            name,
+          });
+          if (!result.ok) return fail(result.error);
+          return ok(result.data ?? { loader: input.loader });
+        } catch (err) {
+          return fail(`install_loader failed: ${err instanceof Error ? err.message : String(err)}`);
         }
       },
     },

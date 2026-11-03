@@ -30,6 +30,8 @@ import type {
   Ctx,
   LaunchInfo,
   LaunchRequest,
+  LoaderInstallRequest,
+  ModInstallRequest,
   ModpackSource,
 } from './types.js';
 
@@ -162,6 +164,11 @@ async function doEnsureAgent(ctx: Ctx): Promise<AgentHandle> {
   const classpath = [hmclJar, ...javafxJars].join(path.delimiter); // ';' on win32, ':' elsewhere
   const java = ctx.javaPath ?? 'java';
   const args = [
+    // The agent JVM is headless (no launcher UI, no game heap); a small explicit
+    // heap keeps the default G1 reservation from exhausting small Windows page
+    // files ("os::commit_memory failed; 页面文件太小" crashes were observed).
+    '-Xmx512m',
+    '-Xms64m',
     `-javaagent:${agentJar}`,
     `-Dhmcl.agent.port=${ctx.agentPort}`,
     `-Dhmcl.agent.token=${ctx.agentToken}`,
@@ -386,6 +393,48 @@ class AgentClient implements AgentHandle {
   async downloadModpack(source: ModpackSource, id: string, versionId?: string): Promise<AgentResult> {
     const body = versionId ? { source, id, versionId } : { source, id };
     return this.asResult(() => this.post('/modpack/download', body, INSTALL_TIMEOUT_MS));
+  }
+
+  async searchMods(
+    source: ModpackSource,
+    query: string,
+    gameVersion?: string,
+    limit?: number,
+  ): Promise<AgentResult> {
+    const body: Record<string, unknown> = { source, query };
+    if (gameVersion) body.gameVersion = gameVersion;
+    if (typeof limit === 'number' && Number.isFinite(limit)) body.limit = limit;
+    return this.asResult(() => this.post('/mods/search', body, 60_000));
+  }
+
+  async getMod(source: ModpackSource, id: string): Promise<AgentResult> {
+    return this.asResult(() => this.post('/mods/info', { source, id }, 60_000));
+  }
+
+  async downloadMod(source: ModpackSource, id: string, versionId?: string): Promise<AgentResult> {
+    const body = versionId ? { source, id, versionId } : { source, id };
+    return this.asResult(() => this.post('/mods/download', body, INSTALL_TIMEOUT_MS));
+  }
+
+  async installMod(req: ModInstallRequest): Promise<AgentResult> {
+    return this.asResult(() => this.post('/mods/install', req, INSTALL_TIMEOUT_MS));
+  }
+
+  async listMods(instance: string): Promise<AgentResult> {
+    return this.asResult(() => this.post('/mods/list', { instance }, DEFAULT_REQUEST_TIMEOUT_MS));
+  }
+
+  async listLoaderVersions(loader: LoaderInstallRequest['loader'], gameVersion: string): Promise<AgentResult> {
+    return this.asResult(() => this.post('/loaders/list', { loader, gameVersion }, 120_000));
+  }
+
+  async installLoader(req: LoaderInstallRequest): Promise<AgentResult> {
+    return this.asResult(() => this.post('/loader/install', req, INSTALL_TIMEOUT_MS));
+  }
+
+  async listRemoteVersions(type?: 'release' | 'snapshot' | 'all'): Promise<AgentResult> {
+    const body = type && type !== 'all' ? { type } : {};
+    return this.asResult(() => this.post('/versions/remote', body, 120_000));
   }
 
   async launch(req: LaunchRequest): Promise<LaunchInfo> {

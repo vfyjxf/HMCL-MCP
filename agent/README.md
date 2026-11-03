@@ -74,7 +74,7 @@ Response:
 ### `POST /versions/install`
 
 Install a vanilla Minecraft version through HMCL's download pipeline
-(`GameBuilder`: version JSON + client jar + libraries; assets are downloaded lazily at launch).
+(`GameBuilder`: version JSON + client jar + libraries + assets index/objects).
 
 Request: `{"version": "1.20.4"}`
 
@@ -82,7 +82,167 @@ Response (success): `{"ok": true, "id": "1.20.4"}`
 
 Common failures (`ok:false`): already installed; version not found in the remote version list
 (`error` names the remote list source); network/IO failures from HMCL tasks
-(`error` carries `Task.getException()` message).
+(`error` carries `Task.getException()` message); a task timeout (`error` says
+`timed out after Ns` — the download source is unreachable; the underlying task may keep
+retrying in the background). Note: HMCL's `GameBuilder` **rolls the version back from disk**
+when its build fails, so a failed install leaves no half-built instance behind (the client
+jar may survive deletion when a verifying thread still holds it open — retry is safe).
+
+### `POST /versions/remote`
+
+List Minecraft versions available for `/versions/install` from the remote version list
+(refreshes the list first; same source as the HMCL UI).
+
+Request: `{"type": "release"}` — optional; `"release"` / `"snapshot"` / omitted (= all).
+
+Response (success):
+
+```json
+{
+  "ok": true,
+  "versions": [
+    { "id": "1.21.4", "type": "release", "releaseDate": "2024-12-03T12:39:22Z" }
+  ]
+}
+```
+
+### `POST /modpack/search`
+
+Search modpacks through HMCL's own addon repositories (`ModrinthRemoteAddonRepository.MODPACKS`
+or `CurseForgeRemoteAddonRepository.MODPACKS` — CurseForge uses HMCL's embedded API key).
+
+Request: `{"source": "modrinth", "query": "fabric", "limit": 20}` — `source` optional
+(defaults to modrinth), `limit` clamped to 1..50.
+
+Response (success): `{"ok": true, "hits": [ { "id": "<slug>", "title": "...", "description": "...",
+"authors": ["..."], "url": "..." } ], "totalPages": 3}`.
+
+### `POST /modpack/info`
+
+Project summary + version list for one modpack (`id` = Modrinth slug or CurseForge slug).
+
+Request: `{"source": "modrinth", "id": "fabulously-optimized"}`
+
+Response (success): `{"ok": true, "summary": {...}, "versions": [ { "id": "<version name>",
+"version": "<version number>", "gameVersions": ["1.21.4"], "loaders": ["fabric"] } ]}` (max 50 versions).
+
+### `POST /modpack/download`
+
+Download a modpack file (SHA-1 verified via HMCL's `FileDownloadTask`) into `<gameDir>/mcpacks/`.
+`versionId` matches a version `name` or `version` from `/modpack/info`; omitted = newest.
+
+Request: `{"source": "modrinth", "id": "fabulously-optimized", "versionId": "..."}`
+
+Response (success): `{"ok": true, "id": "<version name>", "version": "<version number>",
+"gameVersions": [...], "filename": "pack.mrpack", "path": "D:\\mc\\mcpacks\\pack.mrpack",
+"size": 12345, "sha1": "..."}`.
+
+### `POST /mods/search`
+
+Search single mods through HMCL's MODS repositories (`ModrinthRemoteAddonRepository.MODS` /
+`CurseForgeRemoteAddonRepository.MODS`). Same shape as `/modpack/search` plus an optional
+`gameVersion` filter passed to the repository.
+
+Request: `{"source": "modrinth", "query": "sodium", "gameVersion": "1.21.4", "limit": 20}`
+
+Response (success): `{"ok": true, "hits": [ { "id": "<slug>", "numericId": "306612", "downloads": 642357868, "title": "...", ... } ], "totalPages": N}` — `numericId` and `downloads` are only present for CurseForge hits (`numericId` is the numeric project id CurseForge's detail/file APIs require).
+
+### `POST /mods/info`
+
+Mod project summary + version list. Same shape as `/modpack/info`; each version also carries
+`filename` when the file name is known, and `loaders` is a list of ModLoaderType names
+(`FABRIC`, `FORGE`, `NEO_FORGE`, `QUILT`, ...).
+
+CurseForge's detail/file APIs only accept the numeric project id, so a non-numeric `id` is
+resolved through a slug-matching search first (one extra request); if no mod matches, the
+error suggests taking `numericId` from the search results.
+
+### `POST /mods/download`
+
+Download a mod file (SHA-1 verified) into `<gameDir>/modfiles/`. Already-downloaded files are
+reused (no re-download when the target exists).
+
+Request: `{"source": "modrinth", "id": "sodium", "versionId": "..."}` — `versionId` optional
+(matches the version `name` or `version`; omitted = newest).
+
+Response (success): `{"ok": true, "id": "...", "version": "...", "gameVersions": [...],
+"filename": "sodium-0.6.x.jar", "path": "D:\\mc\\modfiles\\sodium-0.6.x.jar", "size": 987654}`.
+
+### `POST /mods/install`
+
+Place a mod into an instance's mods directory (`<gameDir>/versions/<instance>/mods/`). Either
+`id` (download via `/mods/download` semantics, cached in `modfiles/`) or `path` (local file)
+must be given; `instance` must already be installed.
+
+Request: `{"source": "modrinth", "id": "sodium", "versionId": "...", "instance": "1.21.4-fabric"}`
+or `{"path": "D:\\mods\\sodium.jar", "instance": "1.21.4-fabric"}`
+
+Response (success): `{"ok": true, "instance": "1.21.4-fabric",
+"modsDir": "D:\\mc\\versions\\1.21.4-fabric\\mods", "filename": "sodium-0.6.x.jar",
+"path": "D:\\mc\\versions\\1.21.4-fabric\\mods\\sodium-0.6.x.jar"}`.
+
+### `POST /mods/list`
+
+List the `.jar` files in `<gameDir>/versions/<instance>/mods/`.
+
+Request: `{"instance": "1.21.4-fabric"}`
+
+Response (success): `{"ok": true, "instance": "...", "modsDir": "...",
+"mods": [ { "filename": "sodium-0.6.x.jar", "size": 987654 } ]}`.
+
+### `POST /loaders/list`
+
+List loader versions available for one Minecraft version. `loader` must be one of HMCL's
+VersionList ids: `fabric`, `forge`, `neoforge`, `quilt`, `optifine`, `liteloader`,
+`legacyfabric`, `cleanroom`.
+
+Request: `{"loader": "fabric", "gameVersion": "1.21.4"}`
+
+Response (success):
+
+```json
+{
+  "ok": true,
+  "loader": "fabric",
+  "gameVersion": "1.21.4",
+  "versions": [
+    { "id": "0.16.14", "fullVersion": "fabric-loader-0.16.14-1.21.4", "gameVersion": "1.21.4" }
+  ]
+}
+```
+
+`id` is the loader's own version (`RemoteVersion.getSelfVersion()`); `fullVersion` is the
+instance id HMCL would use for a dedicated install.
+
+### `POST /loader/install`
+
+Install a mod loader, two modes:
+
+- **Existing instance** (`instance` given): patches the instance with the loader via
+  `DefaultDependencyManager.installLibraryAsync(Version, RemoteVersion)` — the raw
+  (unresolved) version is passed in. The call downloads the loader libraries and only
+  RETURNS the patched `Version` (id = the loader profile's id); the agent persists it
+  with `repository.saveAsync(patched.setId(instance))`, keeping the user-facing id.
+  The instance's Minecraft version must match the loader's target (`remote.getGameVersion()`).
+- **New instance** (`gameVersion` given, no `instance`): built in TWO phases — first the
+  vanilla game via `GameBuilder.name(name).gameVersion(mc).buildAsync()`, verified
+  (`hasVersion`), then the loader patch via `installLibraryAsync` on that instance.
+  A single all-in-one build would roll the whole version back on any loader-stage failure;
+  the two-phase split keeps a playable vanilla instance alive when the loader stage fails.
+  `name` defaults to `<mc>-<loader>`; an existing instance with the same name is reused
+  (only its loader stage runs, response carries `"reused": true`).
+
+Request: `{"loader": "fabric", "versionId": "0.16.14", "gameVersion": "1.21.4", "name": "my-fabric"}`
+or `{"loader": "forge", "versionId": "51.0.5", "instance": "1.20.4"}` — `fullVersion` may replace
+`versionId`; `gameVersion` may be omitted when `instance` is given (derived from the instance).
+
+Response (success): `{"ok": true, "instance": "my-fabric", "loader": "fabric",
+"loaderVersion": "0.16.14", "fullVersion": "fabric-loader-0.16.14-1.21.4", "gameVersion": "1.21.4"}`
+(`gameVersion` only present in the new-instance mode).
+
+All install/refresh/download endpoints bound their blocking wait
+(refresh 3 min, file download 8 min, install 20 min, launch completion check 15 min);
+a dead download source fails the request with `timed out after Ns` instead of hanging it.
 
 ### `POST /modpack/install`
 

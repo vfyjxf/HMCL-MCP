@@ -11,6 +11,7 @@
     "dev": "tsx src/index.ts",
     "build": "tsc -p tsconfig.json",
     "build:agent": "node agent/build.mjs",
+    "build:jar": "node tools/jar/build-jar.mjs",
     "start": "node dist/index.js",
     "test": "tsx --test \"test/**/*.test.ts\""
   },
